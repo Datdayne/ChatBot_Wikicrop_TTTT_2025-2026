@@ -67,9 +67,6 @@ def retrieve(query, top_k=30, rerank_top_n=5, score_threshold=0.0):
     ranked_candidates = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
 
     for i, (doc, score) in enumerate(ranked_candidates):
-        # --- QUAN TRỌNG: NGƯỠNG LỌC ---
-        # CrossEncoder thường trả về điểm từ -10 đến 10.
-        # Điểm > 0 thường là có liên quan. Điểm < 0 thường là rác.
         if score < score_threshold:
             continue  # Bỏ qua kết quả kém
             
@@ -87,7 +84,7 @@ def retrieve(query, top_k=30, rerank_top_n=5, score_threshold=0.0):
     return results
 
 # ==============================================================================
-# 2. BUILD PROMPT (CHẶT CHẼ HƠN)
+# 2. BUILD PROMPT 
 # ==============================================================================
 def make_prompt(query: str, retrieved: list, role: str = "Chuyên gia nông nghiệp") -> str:
     if not retrieved:
@@ -120,7 +117,7 @@ def make_prompt(query: str, retrieved: list, role: str = "Chuyên gia nông nghi
     return prompt
 
 # ==============================================================================
-# 3. CALL OLLAMA (DÙNG MODEL TỐT HƠN)
+# 3. CALL OLLAMA 
 # ==============================================================================
 def call_ollama(prompt: str, model: str = "qwen2.5", temperature: float = 0.3) -> str:
     """
@@ -150,8 +147,6 @@ def call_ollama(prompt: str, model: str = "qwen2.5", temperature: float = 0.3) -
 # ==============================================================================
 def answer(query: str, model: str = "qwen2.5", debug: bool = True) -> str:
     try:
-        # 1. Retrieve với ngưỡng điểm > 0.5 (hoặc 0.0 tùy dữ liệu)
-        # Nếu bị trả lời "Không tìm thấy" nhiều quá thì hạ xuống 0.0 hoặc -1.0
         retrieved = retrieve(query, top_k=30, rerank_top_n=5, score_threshold=0.0)
 
         if debug:
