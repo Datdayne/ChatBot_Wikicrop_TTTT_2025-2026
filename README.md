@@ -1,6 +1,6 @@
 # 🚀 Hướng dẫn khởi chạy hệ thống RAG
 
-# Dự án sử dụng Ollama với mô hình Gemma 2B
+# Dự án sử dụng Ollama với mô hình gwen 2.5
 
 ## Mô tả
 
@@ -18,9 +18,9 @@ Dự án này sử dụng mô hình **Gemma Qwen2.5** chạy qua **Ollama** đ�
 
 Tải và cài từ: [https://ollama.ai](https://ollama.ai)
 
-### 2. Tải mô hình Gemma 2B
+### 2. Tải mô hình Gwen 2.5
 
-ollama pull gemma:2b
+ollama pull qwen2.5
 
 ## 2️⃣ Cài đặt thư viện cần thiết
 
@@ -32,3 +32,5 @@ Chạy:
 python ./src/server.py
 Mặc định server chạy tại:
 👉 http://127.0.0.1:8000
+
+Lưu Ý : chỉ chạy mỗi "python ./src/server.py"
