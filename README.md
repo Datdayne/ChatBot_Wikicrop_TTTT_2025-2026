@@ -34,3 +34,5 @@ Mặc định server chạy tại:
 👉 http://127.0.0.1:8000
 
 Lưu Ý : chỉ chạy mỗi "python ./src/server.py"
+
+Chú ý : code này được dùng cho wikicrop nên nếu mang đi chỗ khác có thể xảy ra sai sót
