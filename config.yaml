@@ -5,8 +5,7 @@ server:
   host: "127.0.0.1" # Host server API
   port: 8000 # Cổng server API
 
-streamlit:
-  port: 8501 # Cổng Streamlit app
+
 
 # =========================
 # Model & Embedding

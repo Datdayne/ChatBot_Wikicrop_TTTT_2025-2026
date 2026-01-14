@@ -20,7 +20,7 @@ META_FILE = os.path.join(BASE_DIR, "..", "docs.json")
 DATA_DIR = os.path.join(BASE_DIR, "..", "data_output")
 
 # Cấu hình API Wiki
-WIKI_API_URL = "http://localhost/mediawiki/api.php"
+WIKI_API_URL = "http://localhost/wikicrop/api.php"
 
 MODEL_NAME = config["model"]["embedding_model"]
 print(f"🔄 Đang tải model: {MODEL_NAME}...")

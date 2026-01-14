@@ -2,7 +2,7 @@ import requests
 import json
 
 # Đổi link nếu cổng của bạn khác
-API_URL = "http://localhost/mediawiki/api.php"
+API_URL = "http://localhost/wikicrop/api.php"
 
 def test_wiki():
     print(f"ang kết nối tới: {API_URL}...")
