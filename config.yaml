@@ -28,6 +28,13 @@ model:
 # =========================
 vector_db:
   index_path: "./faiss.index" # File FAISS local
-  metadata_path: "./docs.json" # Metadata / JSON lưu raw text
-  top_k: 3 # Lấy top k result khi retrieve
+  metadata_path: "./docs.db" # Database SQLite lưu raw text
+  
+  # --- Performance Settings ---
+  use_reranker: true        # Bật/tắt reranker (Tắt đi để chạy nhanh hơn nhưng kém chính xác hơn)
+  retrieval_top_k: 10       # Số lượng documents lấy sơ bộ từ FAISS (Giảm xuống 10-20 để nhanh hơn)
+  rerank_top_n: 3           # Số lượng documents lấy sau khi rerank
+  
+  # Config cũ (để tham khảo)
+  # top_k: 3
 

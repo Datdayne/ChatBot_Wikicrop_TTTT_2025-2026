@@ -1,25 +1,37 @@
 import numpy as np
 import faiss
-import json
 import requests
 from sentence_transformers import SentenceTransformer, CrossEncoder
 import os
 from config_loader import load_config
+import db  # Import module database mới
 
 # --- CẤU HÌNH ---
 config = load_config()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 INDEX_FILE = os.path.join(BASE_DIR, "..", "faiss.index")
-META_FILE = os.path.join(BASE_DIR, "..", "docs.json")
+
+# Config path to DB is handled inside db.py via config loader, so we just use db module.
 
 RERANK_MODEL = config["model"]["RERANK_MODEL"]
 MODEL_NAME = config["model"]["embedding_model"]
 
+# Config Performance
+USE_RERANKER = config["vector_db"].get("use_reranker", True)
+RETRIEVAL_TOP_K = config["vector_db"].get("retrieval_top_k", 30)
+RERANK_TOP_N = config["vector_db"].get("rerank_top_n", 5)
+
 # --- LOAD MODEL & DATA ---
-print(f"⏳ Đang tải models...\n   - Embedding: {MODEL_NAME}\n   - Reranker: {RERANK_MODEL}")
+print(f"⏳ Đang tải models...\n   - Embedding: {MODEL_NAME}")
 embedder = SentenceTransformer(MODEL_NAME)
-reranker = CrossEncoder(RERANK_MODEL)
+
+if USE_RERANKER:
+    print(f"   - Reranker: {RERANK_MODEL}")
+    reranker = CrossEncoder(RERANK_MODEL)
+else:
+    print("   - Reranker: OFF (Chế độ Fast Mode)")
+    reranker = None
 
 # Load FAISS
 if os.path.exists(INDEX_FILE):
@@ -27,47 +39,61 @@ if os.path.exists(INDEX_FILE):
 else:
     raise FileNotFoundError("❌ Không tìm thấy file faiss.index! Hãy chạy ingest.py trước.")
 
-# Load Metadata
-if os.path.exists(META_FILE):
-    with open(META_FILE, "r", encoding="utf-8") as f:
-        docs = json.load(f)
-else:
-    docs = []
+# Không load docs.json nữa vì đã chuyển sang SQLite (lazy load)
+
+def reload_index():
+    """Reload FAISS index from disk (dùng sau khi Ingest)"""
+    global index
+    if os.path.exists(INDEX_FILE):
+        print("🔄 Reloading FAISS index...")
+        index = faiss.read_index(INDEX_FILE)
+    else:
+        print("⚠️ Không tìm thấy index để reload.")
 
 # ==============================================================================
 # 1. RETRIEVE & RERANK (CÓ LỌC NGƯỠNG ĐIỂM)
 # ==============================================================================
-def retrieve(query, top_k=30, rerank_top_n=5, score_threshold=0.0):
+def retrieve(query, top_k=RETRIEVAL_TOP_K, rerank_top_n=RERANK_TOP_N, score_threshold=0.0):
     """
     Tìm kiếm và lọc kết quả.
     - score_threshold: Ngưỡng điểm tối thiểu. Nếu điểm < 0 (hoặc thấp hơn), bỏ qua.
     """
-    # 1. Embedding Query
-    qv = embedder.encode([query], normalize_embeddings=True).astype("float32")
+    # 1. Embedding Query (Thêm prefix query: cho E5)
+    qv = embedder.encode([f"query: {query}"], normalize_embeddings=True).astype("float32")
 
     # 2. Tìm kiếm thô bằng FAISS
     D, I = index.search(qv, top_k)
     
-    candidates = []
-    # Lấy ra danh sách candidate, bỏ qua -1 (không tìm thấy)
-    for idx in I[0]:
-        if idx != -1 and idx < len(docs):
-            candidates.append(docs[idx])
+    # Lấy ra danh sách ID hợp lệ, bỏ qua -1
+    valid_ids = [int(idx) for idx in I[0] if idx != -1]
+    
+    # Truy vấn nội dung từ SQLite theo ID
+    candidates = db.get_documents_by_ids(valid_ids)
 
     if not candidates:
         return []
 
-    # 3. Rerank bằng CrossEncoder (Chính xác hơn Cosine)
-    pairs = [(query, c["text"]) for c in candidates]
-    scores = reranker.predict(pairs)
+    # 3. Rerank (Nếu bật)
+    if USE_RERANKER:
+        pairs = [(query, c["text"]) for c in candidates]
+        scores = reranker.predict(pairs)
+        
+        # Ghép (candidate, score) lại và sort giảm dần
+        ranked_candidates = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
+    else:
+        # Nếu tắt reranker, giữ nguyên thứ tự FAISS (Khoảng cách Euclid: càng nhỏ càng tốt, nhưng FAISS inner product: càng lớn càng tốt)
+        # Tuy nhiên index đang là inner product hay L2? Thường mặc định là L2 nếu không nói gì. 
+        # Nhưng ở đây ta cứ giả sử FAISS trả về theo thứ tự tốt nhất rồi.
+        # Gán score giả định giảm dần để logic bên dưới hoạt động
+        ranked_candidates = [(c, 1.0 - (i*0.01)) for i, c in enumerate(candidates)]
 
     # 4. Sắp xếp và LỌC (Filtering)
     results = []
-    # Ghép (candidate, score) lại và sort giảm dần
-    ranked_candidates = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
-
+    
     for i, (doc, score) in enumerate(ranked_candidates):
-        if score < score_threshold:
+        # Nếu dùng reranker thì mới care threshold chặt chẽ, 
+        # còn không dùng reranker thì score là giả định, nên bỏ qua check threshold âm
+        if USE_RERANKER and score < score_threshold:
             continue  # Bỏ qua kết quả kém
             
         if len(results) >= rerank_top_n:
@@ -147,7 +173,7 @@ def call_ollama(prompt: str, model: str = "qwen2.5", temperature: float = 0.3) -
 # ==============================================================================
 def answer(query: str, model: str = "qwen2.5", debug: bool = True) -> str:
     try:
-        retrieved = retrieve(query, top_k=30, rerank_top_n=5, score_threshold=0.0)
+        retrieved = retrieve(query)
 
         if debug:
             print(f"\n=== 🔍 Debug: Tìm thấy {len(retrieved)} tài liệu phù hợp ===")

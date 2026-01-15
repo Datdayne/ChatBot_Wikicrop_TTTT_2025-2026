@@ -1,5 +1,4 @@
 import os
-import json
 import uuid
 import numpy as np
 import faiss
@@ -8,15 +7,14 @@ from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from extractors import auto_extract
-from utils import extract_summary, extract_keywords
 from config_loader import load_config
+import db  # Import module database mới
 
 # --- CONFIG ---
 config = load_config()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 INDEX_FILE = os.path.join(BASE_DIR, "..", "faiss.index")
-META_FILE = os.path.join(BASE_DIR, "..", "docs.json")
 DATA_DIR = os.path.join(BASE_DIR, "..", "data_output")
 
 # Cấu hình API Wiki
@@ -35,39 +33,33 @@ text_splitter = RecursiveCharacterTextSplitter(
 )
 
 # --- LOAD FAISS ---
-if os.path.exists(INDEX_FILE) and os.path.exists(META_FILE):
+if os.path.exists(INDEX_FILE):
     print("📂 Tải index cũ...")
     index = faiss.read_index(INDEX_FILE)
-    with open(META_FILE, "r", encoding="utf-8") as f:
-        docs = json.load(f)
 else:
     print("✨ Tạo index mới...")
-    index = faiss.IndexFlatIP(dimension)
-    docs = []
+    # Dùng IndexIDMap để quản lý ID thủ công (khớp vói DB)
+    index = faiss.IndexIDMap(faiss.IndexFlatIP(dimension))
 
-# Tập hợp các nguồn đã xử lý để tránh trùng
-processed_sources = set(d['full_path'] for d in docs)
+# Lấy danh sách nguồn đã xử lý từ DB
+processed_sources = db.get_all_full_paths()
+
+def remove_from_processed(full_path):
+    if full_path in processed_sources:
+        processed_sources.remove(full_path)
 
 # ==============================================================================
 # PHẦN 1: XỬ LÝ NỘI DUNG (Chunk -> Embed)
 # ==============================================================================
-# Sửa dòng định nghĩa hàm: thêm force_update=False
 def process_content(text, source_name, full_identifier, source_type="file", force_update=False):
     """Hàm chung để xử lý văn bản -> Chunk -> Embed"""
     
-    # Logic kiểm tra trùng lặp:
-    # Nếu KHÔNG PHẢI là ép buộc (force=False) VÀ đã tồn tại -> Thì mới bỏ qua
     if not force_update:
-        if source_type == "file" and full_identifier in processed_sources:
+        if full_identifier in processed_sources:
             return [], []
-        # Với Wiki, nếu không force thì cũng bỏ qua nếu đã có
-        if source_type == "wiki" and full_identifier in processed_sources:
-             return [], []
 
     if not text or not text.strip():
         return [], []
-
-    # ... (Phần chunking và embedding bên dưới giữ nguyên) ...
 
     # 1. Chunking
     if len(text) > 1200:
@@ -76,25 +68,22 @@ def process_content(text, source_name, full_identifier, source_type="file", forc
         chunks = [text]
 
     vecs = []
-    metas = []
+    # Thay vì lưu meta dict hoàn chỉnh, ta lưu dữ liệu raw để insert DB
+    db_entries = []
 
     # 2. Embedding từng chunk
     for i, chunk_text in enumerate(chunks):
-        doc_id = str(uuid.uuid4())
+        doc_uuid = str(uuid.uuid4())
         
         display_source = source_name
         if len(chunks) > 1:
             display_source += f" (Đoạn {i+1})"
 
-        # Embed nội dung chunk (Dùng chính chunk_text làm input cho chính xác)
-        # Nếu muốn dùng summary, có thể bỏ comment các dòng dưới
-        # summary_text = extract_summary(chunk_text)
-        embed_input = chunk_text 
-
+        embed_input = f"passage: {chunk_text}" 
         vec = embedder.encode(embed_input, normalize_embeddings=True)
 
-        meta = {
-            "id": doc_id,
+        entry = {
+            "doc_uuid": doc_uuid,
             "source": display_source,
             "rep_type": "wiki_content" if source_type == "wiki" else "file_content",
             "text": chunk_text,
@@ -102,59 +91,48 @@ def process_content(text, source_name, full_identifier, source_type="file", forc
         }
         
         vecs.append(vec)
-        metas.append(meta)
+        db_entries.append(entry)
 
-    return vecs, metas
+    return vecs, db_entries
 
 # ==============================================================================
-# PHẦN 2: HÚT DỮ LIỆU TỪ MEDIAWIKI API (Đã nâng cấp Pagination)
+# PHẦN 2: HÚT DỮ LIỆU TỪ MEDIAWIKI API
 # ==============================================================================
 def fetch_all_wiki_pages():
-    """Lấy TOÀN BỘ bài viết từ Wiki (Xử lý phân trang chuẩn + Lấy raw wikitext)"""
+    """Lấy TOÀN BỘ bài viết từ Wiki"""
     print(f"🌐 Đang kết nối tới Wiki: {WIKI_API_URL}")
     
     session = requests.Session()
-    
-    # Tham số cơ bản (Chưa có token phân trang)
     base_params = {
         "action": "query",
         "generator": "allpages",
-        "gaplimit": "max",     # Lấy tối đa số lượng mỗi lần gọi
-        "prop": "revisions",   # Lấy phiên bản sửa đổi (raw content)
-        "rvprop": "content",   # Nội dung
-        "rvslots": "main",     # Slot chính
+        "gaplimit": "max",
+        "prop": "revisions",
+        "rvprop": "content",
+        "rvslots": "main",
         "format": "json"
     }
 
     results = []
-    last_continue = {} # Biến lưu dấu vết để lật trang
+    last_continue = {}
     page_count = 0
 
-    # --- VÒNG LẶP VÉT CẠN (Pagination Loop) ---
     while True:
-        # Trộn tham số cơ bản với token tiếp theo (nếu có)
         params = {**base_params, **last_continue}
-        
         try:
             resp = session.get(WIKI_API_URL, params=params)
             data = resp.json()
             
-            # Xử lý lỗi API nếu có
             if "error" in data:
                 print(f"❌ API Error: {data['error']}")
                 break
 
-            # 1. Xử lý dữ liệu đợt này
             pages = data.get("query", {}).get("pages", {})
-            
             for page_id, page_data in pages.items():
                 title = page_data.get("title", "")
-                
-                # Bỏ qua các trang hệ thống (Namespace != 0)
                 ns = page_data.get("ns", 0)
                 if ns != 0: continue
 
-                # Lấy nội dung thô (Wikitext) từ cấu trúc JSON
                 content = ""
                 try:
                     revisions = page_data.get("revisions", [])
@@ -170,11 +148,10 @@ def fetch_all_wiki_pages():
             
             print(f"   ... Đã quét được {page_count} bài viết...")
 
-            # 2. Kiểm tra xem còn trang sau không? (Quan trọng)
             if 'continue' in data:
-                last_continue = data['continue'] # Lấy token để đi tiếp vòng sau
+                last_continue = data['continue']
             else:
-                break # Hết dữ liệu rồi, thoát vòng lặp
+                break
 
         except Exception as e:
             print(f"❌ Lỗi khi quét Wiki: {e}")
@@ -192,17 +169,17 @@ def ingest_wiki():
         return
     
     new_vectors = []
-    new_metas = []
+    new_db_entries = []
 
     for title, content, url in tqdm(pages, desc="Processing Wiki", unit="page"):
         v, m = process_content(content, f"Wiki: {title}", url, source_type="wiki")
         if v:
             new_vectors.extend(v)
-            new_metas.extend(m)
+            new_db_entries.extend(m)
 
     if new_vectors:
-        _save_batch(new_vectors, new_metas)
-        print(f"🎉 Đã thêm {len(new_metas)} đoạn văn từ Wiki vào bộ nhớ.")
+        save_batch(new_vectors, new_db_entries)
+        print(f"🎉 Đã thêm {len(new_db_entries)} đoạn văn từ Wiki vào bộ nhớ.")
     else:
         print("⏩ Không có dữ liệu mới từ Wiki để cập nhật.")
 
@@ -218,7 +195,7 @@ def ingest_local_files(root_folder=DATA_DIR):
                 docx_files.append(os.path.join(dirpath, f))
 
     new_vectors = []
-    new_metas = []
+    new_db_entries = []
     
     for path in tqdm(docx_files, desc="Processing Files", unit="file"):
         try:
@@ -226,32 +203,49 @@ def ingest_local_files(root_folder=DATA_DIR):
             v, m = process_content(raw_text, os.path.basename(path), path, source_type="file")
             if v:
                 new_vectors.extend(v)
-                new_metas.extend(m)
+                new_db_entries.extend(m)
         except Exception as e:
             print(f"Lỗi file {path}: {e}")
 
     if new_vectors:
-        _save_batch(new_vectors, new_metas)
-        print(f"🎉 Đã thêm {len(new_metas)} đoạn văn từ File vào bộ nhớ.")
+        save_batch(new_vectors, new_db_entries)
+        print(f"🎉 Đã thêm {len(new_db_entries)} đoạn văn từ File vào bộ nhớ.")
 
 # --- Helper lưu đĩa ---
-def _save_batch(vectors, metas):
+def save_batch(vectors, db_entries):
+    """
+    vectors: list of numpy arrays
+    db_entries: list of dicts (chưa có ID)
+    """
     if not vectors: return
-    vecs_np = np.vstack(vectors).astype("float32")
-    index.add(vecs_np)
-    docs.extend(metas)
-    faiss.write_index(index, INDEX_FILE)
-    with open(META_FILE, "w", encoding="utf-8") as f:
-        json.dump(docs, f, ensure_ascii=False, indent=2)
     
-    for m in metas:
-        processed_sources.add(m['full_path'])
+    # Lấy ID bắt đầu hiện tại từ DB (để khớp với FAISS index)
+    start_id = db.get_doc_count()
+    
+    # Gán ID cho các entry mới
+    final_db_entries = []
+    for i, entry in enumerate(db_entries):
+        entry['id'] = start_id + i
+        final_db_entries.append(entry)
+        # update tracking set
+        processed_sources.add(entry['full_path'])
+
+    # 1. Thêm vào FAISS (với ID cụ thể)
+    vecs_np = np.vstack(vectors).astype("float32")
+    ids_np = np.array([e['id'] for e in final_db_entries], dtype=np.int64)
+    index.add_with_ids(vecs_np, ids_np)
+    
+    faiss.write_index(index, INDEX_FILE)
+
+    # 2. Thêm vào SQLite
+    db.add_documents_batch(final_db_entries)
 
 # ==============================================================================
 # MAIN
 # ==============================================================================
 if __name__ == "__main__":
-    # Lưu ý: Nên xóa file faiss.index và docs.json trước khi chạy nếu muốn làm mới hoàn toàn
+    # Đảm bảo DB được khởi tạo
+    db.init_db()
     
     # 1. Quét file docx
     ingest_local_files()

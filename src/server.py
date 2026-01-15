@@ -12,6 +12,7 @@ import numpy as np
 
 import qa      
 import ingest  
+import db # Import module DB
 from config_loader import load_config
 
 app = FastAPI()
@@ -68,20 +69,20 @@ async def ingest_endpoint(raw_request: Request):
     print(f"📥 Đang xử lý bài viết: {request_data.title}")
     
     try:
-        # 1. XÓA DỮ LIỆU CŨ
-        indices_to_remove = []
-        for i, doc in enumerate(qa.docs):
-            if doc.get('full_path') == request_data.url:
-                indices_to_remove.append(i)
+        # 1. XÓA DỮ LIỆU CŨ TỪ SQLite & Update Index
+        # Xóa khỏi DB và lấy IDs đã xóa
+        deleted_ids = db.delete_documents_by_path(request_data.url)
         
-        if indices_to_remove:
-            print(f"   ♻️ Xóa {len(indices_to_remove)} chunk cũ...")
-            qa.index.remove_ids(np.array(indices_to_remove, dtype=np.int64))
-            for i in sorted(indices_to_remove, reverse=True):
-                del qa.docs[i]
+        # Cập nhật set tracking của ingest
+        ingest.remove_from_processed(request_data.url)
+
+        if deleted_ids:
+            print(f"   ♻️ Đã xóa {len(deleted_ids)} chunk cũ từ DB.")
+            # Xóa khỏi memory index của ingest
+            ingest.index.remove_ids(np.array(deleted_ids, dtype=np.int64))
 
         # 2. TẠO DỮ LIỆU MỚI
-        vecs, metas = ingest.process_content(
+        vecs, db_entries = ingest.process_content(
             request_data.content, 
             f"Wiki: {request_data.title}", 
             request_data.url, 
@@ -91,20 +92,18 @@ async def ingest_endpoint(raw_request: Request):
 
         if not vecs:
             print("⚠️ Nội dung rỗng sau khi xử lý.")
+            # Nếu có xóa mà không có mới -> Save index hiện tại (đã remove) xuống đĩa
+            if deleted_ids:
+                 faiss.write_index(ingest.index, ingest.INDEX_FILE)
+                 qa.reload_index()
             return {"status": "warning", "message": "Nội dung rỗng."}
 
-        # 3. NẠP VÀO RAM
-        vecs_np = np.vstack(vecs).astype("float32")
-        qa.index.add(vecs_np)
-        qa.docs.extend(metas)
-
-        # 4. LƯU XUỐNG ĐĨA
-        faiss.write_index(qa.index, ingest.INDEX_FILE)
-        with open(ingest.META_FILE, "w", encoding="utf-8") as f:
-            json.dump(qa.docs, f, ensure_ascii=False, indent=2)
+        # 3. LƯU VÀO DB & DISK 
+        # ingest.save_batch tự động add vào ingest.index, save disk và insert DB
+        ingest.save_batch(vecs, db_entries)
         
-        for m in metas:
-            ingest.processed_sources.add(m['full_path'])
+        # 4. RELOAD QA INDEX (Để chatbot tìm thấy ngay)
+        qa.reload_index()
 
         print(f"✅ Đã học xong: {request_data.title}")
         return {"status": "success", "chunks": len(vecs)}
